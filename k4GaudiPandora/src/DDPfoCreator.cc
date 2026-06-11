@@ -22,6 +22,7 @@
 #include "CalorimeterHitType.h"
 #include "ClusterShapes.h"
 #include "DDCaloHitCreator.h"
+#include "DDTrackCreatorBase.h"
 
 #include "Api/PandoraApi.h"
 
@@ -49,8 +50,10 @@
 #include <cmath>
 
 DDPfoCreator::DDPfoCreator(const Settings& settings, pandora::Pandora& pandora,
-                           const DDCaloHitCreator* caloHitCreator, const Gaudi::Algorithm* algorithm)
-    : m_settings(settings), m_pandora(pandora), m_caloHitCreator(caloHitCreator), m_algorithm(*algorithm) {}
+                           const DDCaloHitCreator* caloHitCreator, const DDTrackCreatorBase* trackCreator,
+                           const Gaudi::Algorithm* algorithm)
+    : m_settings(settings), m_pandora(pandora), m_caloHitCreator(caloHitCreator), m_trackCreator(trackCreator),
+      m_algorithm(*algorithm) {}
 
 pandora::StatusCode
 DDPfoCreator::CreateParticleFlowObjects(edm4hep::ClusterCollection& pClusterCollection,
@@ -264,7 +267,15 @@ DDPfoCreator::calculateTrackBasedReferencePoint(const pandora::ParticleFlowObjec
       const float z0(pPandoraTrack->GetZ0());
       pandora::CartesianVector intersectionPoint(0.f, 0.f, 0.f);
 
-      const auto& pTrack = *static_cast<const edm4hep::Track*>(pPandoraTrack->GetParentAddress());
+      // Recover the EDM track via the lookup map — GetParentAddress() is an encoded
+      // (collectionID<<32)|index key, NOT a real pointer, so it must not be dereferenced.
+      const edm4hep::Track pTrack = m_trackCreator->GetTrack(pPandoraTrack->GetParentAddress());
+      if (!pTrack.isAvailable() || pTrack.getTrackStates().empty()) {
+        m_algorithm.warning() << "DDPfoCreator::calculateTrackBasedReferencePoint: could not resolve EDM track for "
+                                 "Pandora track parent-address; skipping it in reference-point sum."
+                              << endmsg;
+        continue;
+      }
       auto const& trackState = pTrack.getTrackStates(0);
 
       intersectionPoint.SetValues(trackState.D0 * std::cos(trackState.phi), trackState.D0 * std::sin(trackState.phi),
@@ -374,8 +385,15 @@ bool DDPfoCreator::AreAnyOtherSiblingsInList(const pandora::Track* const pPandor
 void DDPfoCreator::AddTracksToRecoParticle(const pandora::ParticleFlowObject* const pPandoraPfo,
                                            edm4hep::MutableReconstructedParticle& pReconstructedParticle) const {
   for (const auto* pTrack : pPandoraPfo->GetTrackList()) {
-    const auto& pLcioTrack = *static_cast<const edm4hep::Track*>(pTrack->GetParentAddress());
-    pReconstructedParticle.addToTracks(pLcioTrack);
+    // GetParentAddress() is an encoded ID, not a pointer — resolve via the lookup map.
+    const edm4hep::Track edmTrack = m_trackCreator->GetTrack(pTrack->GetParentAddress());
+    if (!edmTrack.isAvailable()) {
+      m_algorithm.warning() << "DDPfoCreator::AddTracksToRecoParticle: could not resolve EDM track for Pandora track "
+                               "parent-address; PFO->track link omitted."
+                            << endmsg;
+      continue;
+    }
+    pReconstructedParticle.addToTracks(edmTrack);
   }
 }
 

@@ -74,6 +74,7 @@ pandora::StatusCode DDTrackCreatorEmpty::CreateTracks(const std::vector<edm4hep:
       PANDORA_THROW_RESULT_IF(pandora::STATUS_CODE_SUCCESS, !=,
                               PandoraApi::Track::Create(m_pandora, trackParameters, *m_lcTrackFactory))
       m_trackVector.push_back(pTrack);
+      m_trackLookup[GetTrackID(pTrack)] = pTrack;
     } catch (pandora::StatusCodeException& statusCodeException) {
       m_algorithm.error() << "Failed to extract a track: " << statusCodeException.ToString() << endmsg;
       m_algorithm.debug() << " failed track : " << pTrack << endmsg;

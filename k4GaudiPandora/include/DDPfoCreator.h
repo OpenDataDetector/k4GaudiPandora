@@ -33,6 +33,7 @@ class VertexCollection;
 } // namespace edm4hep
 
 class DDCaloHitCreator;
+class DDTrackCreatorBase;
 
 class DDPfoCreator {
 public:
@@ -58,7 +59,7 @@ public:
    *  @param  algorithm reference to the Gaudi::Algorithm to use for message streaming
    */
   DDPfoCreator(const Settings& settings, pandora::Pandora& pandora, const DDCaloHitCreator* caloHitCreator,
-               const Gaudi::Algorithm* algorithm);
+               const DDTrackCreatorBase* trackCreator, const Gaudi::Algorithm* algorithm);
 
   DDPfoCreator(const DDPfoCreator&) = delete;
   DDPfoCreator& operator=(const DDPfoCreator&) = delete;
@@ -202,6 +203,7 @@ private:
   const Settings m_settings;           ///< The pfo creator settings
   pandora::Pandora& m_pandora;         ///< Reference to the pandora object from which to extract the pfos
   const DDCaloHitCreator* m_caloHitCreator; ///< Non-owning handle for resolving Pandora hit keys back to EDM hits
+  const DDTrackCreatorBase* m_trackCreator; ///< Non-owning handle for resolving Pandora track keys back to EDM tracks
   const Gaudi::Algorithm& m_algorithm; ///< Reference to the Gaudi algorithm for message streaming
 };
 

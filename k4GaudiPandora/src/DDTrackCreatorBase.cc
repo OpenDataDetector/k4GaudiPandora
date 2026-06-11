@@ -307,10 +307,91 @@ void DDTrackCreatorBase::GetTrackStates(const edm4hep::Track& pTrack,
   // fg: curling TPC tracks have pointers to track segments stored -> need to get track states from last segment!
   const auto& pEndTrack = pTrack.getTracks().empty() ? pTrack : pTrack.getTracks().back();
 
-  this->CopyTrackState(getEDM4hepTrackState(pEndTrack, edm4hep::TrackState::AtLastHit),
-                       trackParameters.m_trackStateAtEnd);
-  this->CopyTrackState(getEDM4hepTrackState(pEndTrack, edm4hep::TrackState::AtCalorimeter),
-                       trackParameters.m_trackStateAtCalorimeter);
+  const auto endTrackStateAtLastHit = getEDM4hepTrackState(pEndTrack, edm4hep::TrackState::AtLastHit);
+  this->CopyTrackState(endTrackStateAtLastHit, trackParameters.m_trackStateAtEnd);
+
+  // Find AtCalorimeter; if missing (e.g. ACTS converters that don't propagate to
+  // the calo surface), synthesise one by helix-extrapolating from AtIP to the
+  // ECal barrel inner radius (cylindrical surface at m_eCalBarrelInnerR; or to
+  // the endcap z if the trajectory exits axially first).
+  edm4hep::TrackState trackStateAtCalo;
+  bool hasAtCalo = false;
+  for (const auto& ts : pEndTrack.getTrackStates()) {
+    if (ts.location == edm4hep::TrackState::AtCalorimeter) {
+      trackStateAtCalo = ts;
+      hasAtCalo = true;
+      break;
+    }
+  }
+  if (!hasAtCalo) {
+    // Synthesise the calorimeter-surface state using Pandora's own (tested) Helix —
+    // identical projection logic to CalculateTrackTimeAtCalorimeter. Take whichever
+    // of the endcap-z plane or the barrel cylinder/polygon the track reaches first
+    // (smallest generic time). A hand-rolled helix here had a sign bug that put the
+    // projection 180° off in phi, so track-cluster association always failed.
+    const auto ip = getEDM4hepTrackState(pEndTrack, edm4hep::TrackState::AtIP);
+    const pandora::Helix helix(ip.phi, ip.D0, ip.Z0, ip.omega, ip.tanLambda, m_settings.m_bField);
+    const pandora::CartesianVector& refPoint(helix.GetReferencePoint());
+
+    float minGenericTime = std::numeric_limits<float>::max();
+    pandora::CartesianVector bestProjection(0.f, 0.f, 0.f);
+
+    // Endcap z-plane (on the side the track is going).
+    const int signPz = (helix.GetMomentum().GetZ() > 0.f) ? 1 : -1;
+    pandora::CartesianVector endcapProjection(0.f, 0.f, 0.f);
+    float endcapTime = std::numeric_limits<float>::max();
+    if (pandora::STATUS_CODE_SUCCESS ==
+        helix.GetPointInZ(static_cast<float>(signPz) * m_settings.m_eCalEndCapInnerZ, refPoint, endcapProjection,
+                          endcapTime)) {
+      if (endcapTime < minGenericTime) {
+        minGenericTime = endcapTime;
+        bestProjection = endcapProjection;
+      }
+    }
+
+    // Barrel surface: polygon (segmented ECal) or cylinder.
+    pandora::CartesianVector barrelProjection(0.f, 0.f, 0.f);
+    if (m_settings.m_eCalBarrelInnerSymmetry > 0) {
+      const float twopi_n = 2.f * static_cast<float>(M_PI) / static_cast<float>(m_settings.m_eCalBarrelInnerSymmetry);
+      for (int i = 0; i < m_settings.m_eCalBarrelInnerSymmetry; ++i) {
+        float t = std::numeric_limits<float>::max();
+        const float phi = twopi_n * static_cast<float>(i) + m_settings.m_eCalBarrelInnerPhi0;
+        if (pandora::STATUS_CODE_SUCCESS ==
+                helix.GetPointInXY(m_settings.m_eCalBarrelInnerR * std::cos(phi),
+                                   m_settings.m_eCalBarrelInnerR * std::sin(phi), std::cos(phi + 0.5 * M_PI),
+                                   std::sin(phi + 0.5 * M_PI), refPoint, barrelProjection, t) &&
+            t < minGenericTime) {
+          minGenericTime = t;
+          bestProjection = barrelProjection;
+        }
+      }
+    } else {
+      float t = std::numeric_limits<float>::max();
+      if (pandora::STATUS_CODE_SUCCESS ==
+              helix.GetPointOnCircle(m_settings.m_eCalBarrelInnerR, refPoint, barrelProjection, t) &&
+          t < minGenericTime) {
+        minGenericTime = t;
+        bestProjection = barrelProjection;
+      }
+    }
+
+    trackStateAtCalo.location = edm4hep::TrackState::AtCalorimeter;
+    trackStateAtCalo.D0 = ip.D0;
+    trackStateAtCalo.phi = ip.phi;
+    trackStateAtCalo.omega = ip.omega;
+    trackStateAtCalo.Z0 = ip.Z0;
+    trackStateAtCalo.tanLambda = ip.tanLambda;
+    trackStateAtCalo.time = ip.time;
+    trackStateAtCalo.referencePoint =
+        edm4hep::Vector3f(bestProjection.GetX(), bestProjection.GetY(), bestProjection.GetZ());
+    if (std::getenv("K4ODD_DEBUG_CALO")) {
+      m_algorithm.info() << "[DBG calo-proj] eCalBarrelInnerR=" << m_settings.m_eCalBarrelInnerR
+                         << " sym=" << m_settings.m_eCalBarrelInnerSymmetry << " synth AtCalo=("
+                         << bestProjection.GetX() << "," << bestProjection.GetY() << "," << bestProjection.GetZ()
+                         << ") r=" << std::hypot(bestProjection.GetX(), bestProjection.GetY()) << endmsg;
+    }
+  }
+  this->CopyTrackState(trackStateAtCalo, trackParameters.m_trackStateAtCalorimeter);
 
   trackParameters.m_isProjectedToEndCap =
       ((std::fabs(trackParameters.m_trackStateAtCalorimeter.Get().GetPosition().GetZ()) < m_settings.m_eCalEndCapInnerZ)

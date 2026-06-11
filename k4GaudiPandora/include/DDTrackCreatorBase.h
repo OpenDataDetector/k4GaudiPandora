@@ -158,6 +158,19 @@ public:
   const TrackVector& GetTrackVector() const;
 
   /**
+   *  @brief  Resolve a Pandora track parent-address back to its edm4hep::Track.
+   *
+   *  Pandora stores `m_pParentAddress = GetTrackIDStar(track)`, which is the
+   *  encoded `(collectionID<<32)|index` reinterpret_cast to void* — NOT a real
+   *  pointer. DDPfoCreator must look the track up via this map rather than
+   *  dereferencing the fake address (mirrors DDCaloHitCreator::GetCalorimeterHit).
+   *
+   *  @param  address the void* parent address stored on the Pandora track
+   *  @return the edm4hep::Track (invalid handle if not found)
+   */
+  edm4hep::Track GetTrack(const void* address) const;
+
+  /**
    *  @brief  Calculate possible second track state at the ECal Endcap
    *
    *  @param track lcio track
@@ -177,6 +190,8 @@ protected:
 
   // FIXME: should probably pass these around so we do not have a state of these collections
   TrackVector m_trackVector;              ///< The track vector
+  std::map<uint64_t, edm4hep::Track>
+      m_trackLookup;                      ///< Map from stable Pandora track key (GetTrackID) to EDM track
   TrackList m_v0TrackList;                ///< The list of v0 tracks
   TrackList m_parentTrackList;            ///< The list of parent tracks
   TrackList m_daughterTrackList;          ///< The list of daughter tracks
@@ -326,10 +341,16 @@ inline const TrackVector& DDTrackCreatorBase::GetTrackVector() const { return m_
 
 inline void DDTrackCreatorBase::Reset() {
   m_trackVector.clear();
+  m_trackLookup.clear();
   m_v0TrackList.clear();
   m_parentTrackList.clear();
   m_daughterTrackList.clear();
   m_trackToPidMap.clear();
+}
+
+inline edm4hep::Track DDTrackCreatorBase::GetTrack(const void* address) const {
+  const auto iter = m_trackLookup.find(reinterpret_cast<uint64_t>(address));
+  return (iter == m_trackLookup.end()) ? edm4hep::Track::makeEmpty() : iter->second;
 }
 
 //------------------------------------------------------------------------------------------------------------------------------------------

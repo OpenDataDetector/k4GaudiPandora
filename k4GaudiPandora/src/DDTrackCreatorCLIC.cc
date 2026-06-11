@@ -47,6 +47,9 @@
 
 // forward declarations. See in DDPandoraPFANewProcessor.cc
 std::vector<double> getTrackingRegionExtent();
+// Helper defined in DDTrackCreatorBase.cc — search a Track for the TrackState at
+// a given edm4hep::TrackState location, throws if missing.
+edm4hep::TrackState getEDM4hepTrackState(const edm4hep::Track& track, int location);
 
 DDTrackCreatorCLIC::DDTrackCreatorCLIC(const Settings& settings, pandora::Pandora& pandora,
                                        const Gaudi::Algorithm* thisAlg, SmartIF<IGeoSvc> geoSvc)
@@ -140,7 +143,13 @@ DDTrackCreatorCLIC::DDTrackCreatorCLIC(const Settings& settings, pandora::Pandor
     }
   }
 
-  m_tanLambdaEndcapDisk = m_endcapDiskZPositions[0] / m_endcapDiskOuterRadii[0];
+  if (!m_endcapDiskZPositions.empty() && !m_endcapDiskOuterRadii.empty()) {
+    m_tanLambdaEndcapDisk = m_endcapDiskZPositions[0] / m_endcapDiskOuterRadii[0];
+  } else {
+    // No ZDiskPetalsData extension on any endcap tracker (e.g. ODD branches that
+    // don't ship CLIC-style FTD metadata). Disk-based hit-count cuts will be no-ops.
+    m_tanLambdaEndcapDisk = 0.f;
+  }
 }
 
 pandora::StatusCode DDTrackCreatorCLIC::CreateTracks(const std::vector<edm4hep::Track>& tracks) {
@@ -154,7 +163,10 @@ pandora::StatusCode DDTrackCreatorCLIC::CreateTracks(const std::vector<edm4hep::
       m_algorithm.error() << "Track has no track states " << endmsg;
       throw pandora::StatusCodeException(pandora::STATUS_CODE_INVALID_PARAMETER);
     }
-    const auto& trackState = pTrack.getTrackStates()[0];
+    // ACTS writes track states in order [AtLastHit, ..., AtFirstHit, AtIP], so the
+    // [0]-th state is AtLastHit and lacks the perigee D0/Z0/referencePoint we need.
+    // Search for the AtIP state explicitly.
+    const edm4hep::TrackState trackState = getEDM4hepTrackState(pTrack, edm4hep::TrackState::AtIP);
 
     // Proceed to create the pandora track
     lc_content::LCTrackParameters trackParameters;
@@ -195,6 +207,10 @@ pandora::StatusCode DDTrackCreatorCLIC::CreateTracks(const std::vector<edm4hep::
       PANDORA_THROW_RESULT_IF(pandora::STATUS_CODE_SUCCESS, !=,
                               PandoraApi::Track::Create(m_pandora, trackParameters, *m_lcTrackFactory))
       m_trackVector.push_back(pTrack);
+      // Register the encoded-ID -> EDM track mapping so DDPfoCreator can recover
+      // the edm4hep::Track from the Pandora track's parent-address (which is the
+      // encoded GetTrackID, not a real pointer).
+      m_trackLookup[GetTrackID(pTrack)] = pTrack;
     } catch (pandora::StatusCodeException& statusCodeException) {
       m_algorithm.error() << "Failed to extract a track: " << statusCodeException.ToString() << endmsg;
       m_algorithm.debug() << " failed track : " << pTrack << endmsg;
@@ -331,7 +347,14 @@ void DDTrackCreatorCLIC::DefineTrackPfoUsage(const edm4hep::Track& pTrack,
   bool canFormClusterlessPfo = false;
 
   if (trackParameters.m_reachesCalorimeter.Get() && !IsParent(pTrack)) {
-    const auto& firstTrackState = pTrack.getTrackStates(0);
+    // D0/Z0 vertex cuts must use the perigee (AtIP) state. (getTrackStates(0) is the
+    // first stored state, which for ACTS tracks is AtLastHit with D0=Z0=0.)
+    edm4hep::TrackState firstTrackState;
+    try {
+      firstTrackState = getEDM4hepTrackState(pTrack, edm4hep::TrackState::AtIP);
+    } catch (const pandora::StatusCodeException&) {
+      firstTrackState = pTrack.getTrackStates(0);
+    }
 
     double rInner = std::numeric_limits<double>::max();
     double zMin = std::numeric_limits<double>::max();
@@ -340,6 +363,21 @@ void DDTrackCreatorCLIC::DefineTrackPfoUsage(const edm4hep::Track& pTrack,
       const auto pPosition = hit.getPosition();
       rInner = std::min(rInner, std::hypot(pPosition[0], pPosition[1]));
       zMin = std::min(zMin, std::fabs(pPosition[2]));
+    }
+
+    // ACTS tracks carry no edm4hep TrackerHit relation, so the loop above leaves
+    // rInner/zMin at +inf and the track silently never forms a charged PFO. The
+    // AtFirstHit track-state referencePoint IS the innermost measurement position —
+    // use it as the rInner/zMin proxy when the hit relation is empty.
+    if (rInner == std::numeric_limits<double>::max()) {
+      try {
+        const auto firstHitState = getEDM4hepTrackState(pTrack, edm4hep::TrackState::AtFirstHit);
+        const auto rp = firstHitState.referencePoint;
+        rInner = std::hypot(rp[0], rp[1]);
+        zMin = std::fabs(rp[2]);
+      } catch (const pandora::StatusCodeException&) {
+        // No AtFirstHit either — leave rInner/zMin at +inf (track won't form a PFO).
+      }
     }
 
     if (PassesQualityCuts(pTrack, trackParameters)) {
@@ -369,6 +407,15 @@ void DDTrackCreatorCLIC::DefineTrackPfoUsage(const edm4hep::Track& pTrack,
         canFormPfo = true;
       }
 
+      if (std::getenv("K4ODD_DEBUG_CALO")) {
+        m_algorithm.info() << "[DBG pfo-usage] reaches=" << trackParameters.m_reachesCalorimeter.Get()
+                           << " projEndcap=" << trackParameters.m_isProjectedToEndCap.Get()
+                           << " rInner=" << rInner << " zMin=" << zMin
+                           << " trackerInnerR=" << m_trackerInnerR << " D0=" << firstTrackState.D0
+                           << " Z0=" << firstTrackState.Z0 << " zCutNV=" << zCutForNonVertexTracks
+                           << " passRz=" << passRzQualityCuts << " canFormPfo=" << canFormPfo << endmsg;
+      }
+
       // Decide whether track can be used to form a charged PFO, even if track fails to be associated with a pandora
       // cluster
       const float particleMass = trackParameters.m_mass.Get();
@@ -396,6 +443,11 @@ void DDTrackCreatorCLIC::DefineTrackPfoUsage(const edm4hep::Track& pTrack,
                         << " -  canFormClusterlessPfo = " << canFormClusterlessPfo << endmsg;
   }
 
+  if (std::getenv("K4ODD_DEBUG_CALO")) {
+    m_algorithm.info() << "[DBG pfo-final] reaches=" << trackParameters.m_reachesCalorimeter.Get()
+                       << " isParent=" << IsParent(pTrack) << " canFormPfo=" << canFormPfo
+                       << " canFormClusterlessPfo=" << canFormClusterlessPfo << endmsg;
+  }
   trackParameters.m_canFormPfo = canFormPfo;
   trackParameters.m_canFormClusterlessPfo = canFormClusterlessPfo;
 }
@@ -404,6 +456,24 @@ void DDTrackCreatorCLIC::DefineTrackPfoUsage(const edm4hep::Track& pTrack,
 
 void DDTrackCreatorCLIC::TrackReachesECAL(const edm4hep::Track& pTrack,
                                           PandoraApi::Track::Parameters& trackParameters) const {
+  // ACTS tracks carry no edm4hep TrackerHit relation, so the hit-position logic
+  // below can't run. Fall back to the (synthesised) AtCalorimeter state radius —
+  // identical to DDTrackCreatorEmpty::TrackReachesECAL: the track reaches the calo
+  // if its extrapolated calo-entry radius is at/beyond the ECal barrel inner radius.
+  if (pTrack.getTrackerHits().empty()) {
+    const pandora::CartesianVector posAtCalo(trackParameters.m_trackStateAtCalorimeter.Get().GetPosition());
+    const double radiusAtCalo = std::hypot(posAtCalo.GetX(), posAtCalo.GetY());
+    const double zAtCalo = std::fabs(posAtCalo.GetZ());
+    // Reaches the calo if the extrapolated calo-entry point is at/beyond the ECal BARREL
+    // inner radius OR (for forward, high-|eta| tracks) at/beyond the ECal ENDCAP inner z.
+    // The original barrel-only check silently rejected EVERY endcap track: a forward track's
+    // calo entry is on the endcap face (radius < eCalBarrelInnerR), so reachesCalorimeter was
+    // false and no charged PFO ever formed at |eta|>~1.5.
+    trackParameters.m_reachesCalorimeter =
+        (radiusAtCalo >= m_settings.m_eCalBarrelInnerR) || (zAtCalo >= m_settings.m_eCalEndCapInnerZ);
+    return;
+  }
+
   // Calculate hit position information
   float hitZMin = std::numeric_limits<float>::max();
   float hitZMax = -std::numeric_limits<float>::max();
