@@ -33,6 +33,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -182,33 +183,39 @@ pandora::StatusCode DDMCParticleCreator::CreateCaloHitToMCParticleRelationships(
     calorimeterHitVector.push_back(&hit);
   }
 
+  // O(N+M) truth linking. The original code linear-scanned the ENTIRE link collection for EVERY
+  // selected calo hit (O(N*M)); at <mu>=200 (N,M ~ 1e5 calo hits/links) that is ~1e10 ops and was the
+  // single dominant cost — >1.5 h/event, killing the reco before Pandora even ran. Instead build an
+  // O(1) set of the selected hit keys once, then iterate each link collection ONCE and test membership.
+  // (The CaloHit<->SimCaloHit digi link is 1:1 per hit, so iterating links covers every selected hit.)
+  std::unordered_set<uint64_t> validHitKeys;
+  validHitKeys.reserve(calorimeterHitVector.size() * 2);
+  for (const auto* caloHit : calorimeterHitVector) {
+    validHitKeys.insert((static_cast<uint64_t>(caloHit->getObjectID().collectionID) << 32) |
+                        static_cast<uint32_t>(caloHit->getObjectID().index));
+  }
+
   for (const auto& hitRelCollection : caloRelCollections) {
-    for (const auto* caloHit : calorimeterHitVector) {
+    for (const auto&& caloHitLink : *hitRelCollection) {
       try {
+        const auto& linkedCaloHit = caloHitLink.get<edm4hep::CalorimeterHit>();
+        const uint64_t key = (static_cast<uint64_t>(linkedCaloHit.getObjectID().collectionID) << 32) |
+                             static_cast<uint32_t>(linkedCaloHit.getObjectID().index);
+        if (validHitKeys.find(key) == validHitKeys.end())
+          continue;
+
         mcParticleToEnergyWeightMap.clear();
-
-        for (const auto&& caloHitLink : *hitRelCollection) {
-          const auto& linkedCaloHit = caloHitLink.get<edm4hep::CalorimeterHit>();
-          if (linkedCaloHit.getObjectID().collectionID != caloHit->getObjectID().collectionID ||
-              linkedCaloHit.getObjectID().index != caloHit->getObjectID().index)
-            continue;
-
-          const auto& simHit = caloHitLink.get<edm4hep::SimCalorimeterHit>();
-          for (const auto& conb : simHit.getContributions()) {
-            const auto& ipa = conb.getParticle();
-            float ien = conb.getEnergy();
-
-            mcParticleToEnergyWeightMap[&ipa] += ien;
-          }
+        const auto& simHit = caloHitLink.get<edm4hep::SimCalorimeterHit>();
+        for (const auto& conb : simHit.getContributions()) {
+          const auto& ipa = conb.getParticle();
+          mcParticleToEnergyWeightMap[&ipa] += conb.getEnergy();
         }
 
         for (const auto& mcPToE : mcParticleToEnergyWeightMap) {
           PANDORA_THROW_RESULT_IF(
               pandora::STATUS_CODE_SUCCESS, !=,
               PandoraApi::SetCaloHitToMCParticleRelationship(
-                  m_pandora,
-                  reinterpret_cast<const void*>((static_cast<uint64_t>(caloHit->getObjectID().collectionID) << 32) |
-                                                static_cast<uint32_t>(caloHit->getObjectID().index)),
+                  m_pandora, reinterpret_cast<const void*>(key),
                   getObjectAddress(mcPToE.first->getObjectID()), mcPToE.second))
         }
       } catch (const std::exception& exception) {
