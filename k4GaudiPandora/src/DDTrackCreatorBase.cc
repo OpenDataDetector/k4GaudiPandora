@@ -525,7 +525,11 @@ void DDTrackCreatorBase::GetTrackStatesAtCalo(edm4hep::Track const& track,
 
 float DDTrackCreatorBase::CalculateTrackTimeAtCalorimeter(const edm4hep::Track& track) const {
 
-  auto const& ts = track.getTrackStates(edm4hep::TrackState::AtIP);
+  // Index lookup (the state at index AtIP == 1), as before: newer EDM4hep deletes the
+  // getTrackStates(Location) overload because it silently took the enum as an index.
+  // Upstream key4hep/k4GaudiPandora#37 switched to a lookup by location instead; that
+  // changes the result for track-state orderings where index 1 is not AtIP.
+  auto const& ts = track.getTrackStates(static_cast<std::size_t>(edm4hep::TrackState::AtIP));
   const pandora::Helix helix(ts.phi, ts.D0, ts.Z0, ts.omega, ts.tanLambda, m_settings.m_bField);
   const pandora::CartesianVector& referencePoint(helix.GetReferencePoint());
 
